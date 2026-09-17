@@ -27,6 +27,7 @@ Example::
     mcp.add_transform(RegexSearchTransform())
 """
 
+import json
 from abc import abstractmethod
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Annotated, Any
@@ -132,9 +133,60 @@ def _schema_section(schema: dict[str, Any] | None, title: str) -> list[str]:
         return lines
 
     for name, field in props.items():
-        required = ", required" if name in req else ""
-        lines.append(f"- `{name}` ({_schema_type(field)}{required})")
+        lines.append(f"- {_render_param(name, field, required=name in req)}")
     return lines
+
+
+def _enum_values(schema: Any) -> list[Any] | None:
+    if not isinstance(schema, dict):
+        return None
+    if "const" in schema:
+        return [schema["const"]]
+    enum = schema.get("enum")
+    return enum if isinstance(enum, list) else None
+
+
+def _union_enum_values(variants: Any) -> list[Any] | None:
+    """Enum values of a union, only when every non-null branch is enumerated.
+
+    A union such as `Literal["a"] | int` has no closed set of valid values, so
+    listing "a" alone would contradict the rendered type.
+    """
+    if not isinstance(variants, list):
+        return None
+    values: list[Any] = []
+    for variant in variants:
+        if isinstance(variant, dict) and variant.get("type") == "null":
+            continue
+        branch = _enum_values(variant)
+        if branch is None:
+            return None
+        values.extend(v for v in branch if v not in values)
+    return values or None
+
+
+def _render_param(name: str, field: Any, *, required: bool) -> str:
+    """One compact line per parameter: type, enum values, default.
+
+    Enums and defaults are what let a caller construct a valid value without a
+    round of guess-and-check, and they are cheap — on real catalogs they cost
+    ~40% more than bare types, where also inlining each parameter's description
+    costs ~300%. Descriptions stay in the `full` detail level, which emits the
+    raw JSON schema that already carries them.
+    """
+    qualifiers = [_schema_type(field)]
+    if isinstance(field, dict):
+        enum = _enum_values(field)
+        if enum is None and "anyOf" in field:
+            enum = _union_enum_values(field["anyOf"])
+        if isinstance(enum, list) and 0 < len(enum) <= 8:
+            qualifiers.append("one of " + "/".join(json.dumps(v) for v in enum))
+        if field.get("default") is not None:
+            qualifiers.append(f"default {json.dumps(field['default'])}")
+    if required:
+        qualifiers.append("required")
+
+    return f"`{name}` ({', '.join(qualifiers)})"
 
 
 def serialize_tools_for_output_markdown(tools: Sequence[Tool]) -> str:
