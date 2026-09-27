@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # /// script
-# requires-python = ">=3.11"
+# requires-python = ">=3.10"
 # dependencies = []
 # ///
 """
@@ -21,11 +21,14 @@ Requires `gh` authenticated with read access.
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import urllib.request
-from datetime import UTC, date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+
+UTC = timezone.utc
 
 REPO = "PrefectHQ/fastmcp"
 SCHEMA = "fastmcp-maintenance/1"
@@ -131,6 +134,76 @@ def gh_json(*args: str):
     return json.loads(out.stdout)
 
 
+MAIN_WORKFLOWS = (
+    "Tests",
+    "Run static analysis",
+    "CodeQL",
+    "Downstream smoke",
+    "Schema Crash Test",
+)
+
+
+def main_health() -> dict:
+    """Report main checks, including GitHub's automatic CodeQL runs."""
+    commit = gh_json("api", f"repos/{REPO}/commits/main")
+    sha = commit["sha"]
+    runs = []
+    for event in ("push", "dynamic"):
+        runs.extend(
+            gh_json(
+                "api",
+                "-X",
+                "GET",
+                f"repos/{REPO}/actions/runs",
+                "-f",
+                "branch=main",
+                "-f",
+                f"event={event}",
+                "-f",
+                f"head_sha={sha}",
+                "-f",
+                "per_page=100",
+            )["workflow_runs"]
+        )
+    checks = []
+    for name in MAIN_WORKFLOWS:
+        matching = [
+            r
+            for r in runs
+            if (
+                r["name"] == name
+                or (
+                    name == "CodeQL"
+                    and r.get("path") == "dynamic/github-code-scanning/codeql"
+                )
+            )
+            and r["head_sha"] == sha
+            and r.get("event") in {"push", "dynamic"}
+        ]
+        run = max(matching, key=lambda r: r["id"]) if matching else None
+        if run is None and name in {"Downstream smoke", "Schema Crash Test"}:
+            continue
+        if run is None:
+            state = "unknown"
+        elif run["status"] != "completed":
+            state = "pending"
+        elif run["conclusion"] == "success":
+            state = "ok"
+        elif run["conclusion"] in {
+            "failure",
+            "timed_out",
+            "startup_failure",
+            "action_required",
+        }:
+            state = "failed"
+        else:
+            state = "unknown"
+        checks.append(
+            {"name": name, "state": state, "url": run["html_url"] if run else None}
+        )
+    return {"sha": sha, "url": commit["html_url"], "checks": checks}
+
+
 def one_workflow(file: str, since: date) -> dict:
     """State, last success, and outcome counts for one workflow over the window."""
     enabled = (
@@ -190,7 +263,23 @@ def one_workflow(file: str, since: date) -> dict:
         "last_ok_day": last_ok["created_at"][:10] if last_ok else None,
         "succeeded": len(ok),
         "failed": len(done) - len(ok),
+        "daily": daily_runs(done, since),
     }
+
+
+def daily_runs(runs: list[dict], since: date) -> list[dict]:
+    days = []
+    for offset in range((datetime.now(UTC).date() - since).days + 1):
+        day = (since + timedelta(days=offset)).isoformat()
+        matching = [r for r in runs if r["created_at"][:10] == day]
+        days.append(
+            {
+                "day": day,
+                "succeeded": sum(r["conclusion"] == "success" for r in matching),
+                "failed": sum(r["conclusion"] != "success" for r in matching),
+            }
+        )
+    return days
 
 
 def workflow_health(
@@ -216,9 +305,19 @@ def workflow_health(
     else:
         state = "ok"
     days = [m["last_ok_day"] for m in members if m["last_ok_day"]]
+    daily = {}
+    for member in members:
+        for bucket in member["daily"]:
+            row = daily.setdefault(
+                bucket["day"],
+                {"day": bucket["day"], "succeeded": 0, "failed": 0, "blocked": 0},
+            )
+            row["succeeded"] += bucket["succeeded"]
+            row["blocked" if outcomes else "failed"] += bucket["failed"]
     return {
         "state": state,
         "last_ok_day": max(days) if days else None,
+        "daily": list(daily.values()),
         "counts": {
             (outcomes or ("succeeded", "failed"))[0]: sum(
                 m["succeeded"] for m in members
@@ -242,7 +341,7 @@ def contributor_queue() -> dict:
         "--limit",
         "500",
         "--json",
-        "createdAt",
+        "createdAt,number,title,url",
     )
     now = datetime.now(UTC)
     ages = [
@@ -250,6 +349,17 @@ def contributor_queue() -> dict:
         for p in prs
     ]
     return {
+        "items": [
+            {
+                "number": p["number"],
+                "title": p["title"],
+                "url": p["url"],
+                "age_days": (
+                    now - datetime.fromisoformat(p["createdAt"].replace("Z", "+00:00"))
+                ).days,
+            }
+            for p in sorted(prs, key=lambda p: p["createdAt"])[:10]
+        ],
         "id": "contributor-queue",
         "name": "contributor queue",
         "what": "external PRs waiting for their author to be assigned to a linked issue",
@@ -351,7 +461,7 @@ def operator_entries() -> list[dict]:
 
 
 def build() -> dict:
-    since = date.today() - timedelta(days=WINDOW_DAYS)
+    since = datetime.now(UTC).date() - timedelta(days=WINDOW_DAYS - 1)
     automations = []
     for a in AUTOMATIONS:
         try:
@@ -371,12 +481,18 @@ def build() -> dict:
                 "evidence_url": f"https://github.com/{REPO}/actions/workflows/{a['workflows'][0]}",
                 "window": f"{WINDOW_DAYS}d",
                 "counts": h["counts"],
+                "daily": h.get("daily", []),
             }
         )
     try:
         automations.append(contributor_queue())
     except (subprocess.CalledProcessError, ValueError, KeyError) as e:
         print(f"contributor-queue: {e}", file=sys.stderr)
+    try:
+        main = main_health()
+    except (subprocess.CalledProcessError, ValueError, KeyError) as e:
+        print(f"main: could not read checks: {e}", file=sys.stderr)
+        main = None
     return {
         "schema": SCHEMA,
         "publisher": "fastmcp-actions",
@@ -385,6 +501,7 @@ def build() -> dict:
         .isoformat()
         .replace("+00:00", "Z"),
         "automations": automations + operator_entries(),
+        "main": main,
         "needs_judgment": JUDGMENT,
         "docs": {
             "maintaining": f"https://github.com/{REPO}/blob/main/docs/development/contributing.mdx#maintenance-and-automation",
@@ -459,9 +576,14 @@ def main() -> None:
     out = Path(sys.argv[1] if len(sys.argv) > 1 else "status-out")
     out.mkdir(parents=True, exist_ok=True)
     doc = build()
+    if len(sys.argv) > 2:
+        doc["attention"] = json.loads(Path(sys.argv[2]).read_text())
     (out / "status.json").write_text(json.dumps(doc, indent=2) + "\n")
     (out / "STATUS.md").write_text(markdown(doc))
     (out / "badge.json").write_text(json.dumps(badge(doc)) + "\n")
+    site = Path(__file__).resolve().parent.parent / "status-site"
+    for name in ("index.html", "style.css", "app.js"):
+        shutil.copyfile(site / name, out / name)
     print(markdown(doc))
 
 
